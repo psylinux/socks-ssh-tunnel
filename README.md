@@ -1,4 +1,4 @@
-# SOCKS-via-SSH
+# socks-ssh-tunnel
 
 A lightweight Bash script to manage a SOCKS5 proxy over an SSH tunnel. It features a supervisor loop that automatically restarts the tunnel if it drops, background execution, and easy process management.
 
@@ -20,25 +20,25 @@ A lightweight Bash script to manage a SOCKS5 proxy over an SSH tunnel. It featur
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/psylinux/socks-via-ssh.git
-   cd socks-via-ssh
+   git clone https://github.com/psylinux/socks-ssh-tunnel.git
+   cd socks-ssh-tunnel
    ```
 2. Make the script executable:
    ```bash
-   chmod +x socks-via-ssh.sh
+   chmod +x socks-ssh-tunnel.sh
    ```
 
 ## Usage
 
 ### Commands
 
-| Command                      | Description                                     |
-| :--------------------------- | :---------------------------------------------- |
-| `./socks-via-ssh.sh start`   | Starts the tunnel supervisor in the background. |
-| `./socks-via-ssh.sh stop`    | Stops the supervisor and the tunnel.            |
-| `./socks-via-ssh.sh status`  | Checks if the supervisor is currently running.  |
-| `./socks-via-ssh.sh restart` | Restarts the tunnel.                            |
-| `./socks-via-ssh.sh logs`    | Tails the tunnel log file.                      |
+| Command                         | Description                                     |
+| :------------------------------ | :---------------------------------------------- |
+| `./socks-ssh-tunnel.sh start`   | Starts the tunnel supervisor in the background. |
+| `./socks-ssh-tunnel.sh stop`    | Stops the supervisor and the tunnel.            |
+| `./socks-ssh-tunnel.sh status`  | Checks if the supervisor is currently running.  |
+| `./socks-ssh-tunnel.sh restart` | Restarts the tunnel.                            |
+| `./socks-ssh-tunnel.sh logs`    | Tails the tunnel log file.                      |
 
 ### Configuration
 
@@ -59,7 +59,7 @@ You can override the default configuration using environment variables:
 
 Start the tunnel with custom settings:
 ```bash
-SSH_HOST=my-remote-server SSH_USER=myuser SOCKS_PORT=9050 ./socks-via-ssh.sh start
+SSH_HOST=my-remote-server SSH_USER=myuser SOCKS_PORT=9050 ./socks-ssh-tunnel.sh start
 ```
 
 ## Browser Configuration (Firefox)

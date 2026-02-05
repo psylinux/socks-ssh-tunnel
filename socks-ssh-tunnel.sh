@@ -27,25 +27,17 @@ set -euo pipefail
 # Author: Marcos Azevedo (psylinux@gmail.com)
 # Date: 2026-02-05
 # Last Modified: 2026-02-05
-# 
+#
 # Description: SOCKS5 over SSH tunnel with:
 # - background mode
 # - PID file
 # - auto-restart on failure
 #
-# How to use:
-#   ./socks-via-ssh start
-#   ./socks-via-ssh stop
-#   ./socks-via-ssh status
-#   ./socks-via-ssh restart
-#   ./socks-via-ssh logs
-#
-# ============================================================
 # Notes:
-# - SOCKS5 = proxy protocol
-# - SSH    = Secure Shell (encrypted tunnel)
-# - PID    = Process ID
-# - TCP    = Transmission Control Protocol (reliable transport)
+# - SOCKS5 = proxy protocol (Socket Secure v5: proxy TCP/UDP via um endpoint)
+# - SSH    = Secure Shell (túnel criptografado)
+# - PID    = Process ID (identificador do processo)
+# - TCP    = Transmission Control Protocol (transporte confiável)
 # ============================================================
 
 # ----------------------------
@@ -61,11 +53,16 @@ SOCKS_PORT="${SOCKS_PORT:-1080}"
 ALIVE_INTERVAL="${ALIVE_INTERVAL:-60}"
 ALIVE_COUNTMAX="${ALIVE_COUNTMAX:-3}"
 
+# If 1, stop/start will also kill *orphan ssh listeners* on SOCKS_PORT.
+# (Conservador: só mata processo "ssh" que está LISTEN na porta)
+KILL_SSH_LISTENERS_ON_PORT="${KILL_SSH_LISTENERS_ON_PORT:-1}"
+
 # Where to store PID/logs
 STATE_DIR="${STATE_DIR:-$HOME/.socks-ssh-tunnel}"
 PID_FILE="$STATE_DIR/tunnel.pid"
 STOP_FLAG="$STATE_DIR/stop"
 LOG_FILE="$STATE_DIR/tunnel.log"
+SSH_PID_FILE="$STATE_DIR/ssh.pid"
 
 # ----------------------------
 # Helpers
@@ -88,22 +85,61 @@ get_pid() {
   [[ -f "$PID_FILE" ]] && cat "$PID_FILE" || true
 }
 
+get_ssh_pid() {
+  [[ -f "$SSH_PID_FILE" ]] && cat "$SSH_PID_FILE" || true
+}
+
+# True if ANY process is listening on SOCKS_PORT/TCP
 port_in_use() {
-  # lsof exists by default on macOS
   lsof -nP -iTCP:"$SOCKS_PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# Return PIDs listening on SOCKS_PORT/TCP
+listener_pids() {
+  lsof -nP -iTCP:"$SOCKS_PORT" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
+}
+
+pid_command() {
+  ps -p "$1" -o command= 2>/dev/null || true
 }
 
 kill_pid_gracefully() {
   local pid="$1"
   if is_running_pid "$pid"; then
     kill "$pid" >/dev/null 2>&1 || true
-    # wait a bit
-    for _ in {1..20}; do
+    for _ in {1..30}; do
       is_running_pid "$pid" || return 0
       sleep 0.1
     done
     kill -9 "$pid" >/dev/null 2>&1 || true
   fi
+}
+
+# Kill ssh processes that are LISTENing on SOCKS_PORT/TCP.
+# This handles orphaned tunnels like the one you had (PPID=1).
+kill_ssh_listeners_on_port() {
+  [[ "$KILL_SSH_LISTENERS_ON_PORT" == "1" ]] || return 0
+
+  local pids
+  pids="$(listener_pids)"
+  [[ -z "$pids" ]] && return 0
+
+  for pid in $pids; do
+    local cmd
+    cmd="$(pid_command "$pid")"
+    [[ -z "$cmd" ]] && continue
+
+    # Only kill if it's ssh (conservador)
+    if [[ "$cmd" == ssh\ * || "$cmd" == */ssh\ * ]]; then
+      log "killing ssh listener on ${SOCKS_HOST}:${SOCKS_PORT} (PID=$pid) cmd='$cmd'"
+      kill_pid_gracefully "$pid"
+    fi
+  done
+}
+
+show_port_listeners() {
+  echo "Listeners on TCP/${SOCKS_PORT}:"
+  lsof -nP -iTCP:"$SOCKS_PORT" -sTCP:LISTEN || true
 }
 
 # ----------------------------
@@ -113,6 +149,19 @@ run_loop() {
   ensure_state_dir
   rm -f "$STOP_FLAG"
   echo "$$" > "$PID_FILE"
+
+  cleanup() {
+    local ssh_pid
+    ssh_pid="$(get_ssh_pid)"
+    if [[ -n "$ssh_pid" ]]; then
+      kill_pid_gracefully "$ssh_pid"
+      rm -f "$SSH_PID_FILE"
+    fi
+    rm -f "$PID_FILE" "$STOP_FLAG"
+    log "tunnel supervisor stopped"
+  }
+  trap cleanup EXIT INT TERM
+
   log "tunnel supervisor started (PID=$$)"
   log "SOCKS5 listening on ${SOCKS_HOST}:${SOCKS_PORT} (local)"
   log "SSH target ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
@@ -122,12 +171,9 @@ run_loop() {
   local max_backoff=30
 
   while true; do
-    if [[ -f "$STOP_FLAG" ]]; then
-      log "stop flag detected; exiting supervisor"
-      break
-    fi
+    [[ -f "$STOP_FLAG" ]] && { log "stop flag detected; exiting supervisor"; break; }
 
-    # If local port is already used, don't spin aggressively.
+    # If local port is used, wait. (start should avoid this; still, be safe.)
     if port_in_use; then
       log "port ${SOCKS_PORT}/TCP already in use; waiting..."
       sleep 2
@@ -135,20 +181,24 @@ run_loop() {
     fi
 
     log "starting ssh dynamic forward (-D) ..."
-    # Start SSH in foreground; if it dies, we restart.
     ssh -N -D "${SOCKS_HOST}:${SOCKS_PORT}" -p "${SSH_PORT}" \
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval="${ALIVE_INTERVAL}" \
       -o ServerAliveCountMax="${ALIVE_COUNTMAX}" \
-      "${SSH_USER}@${SSH_HOST}" >>"$LOG_FILE" 2>&1
+      "${SSH_USER}@${SSH_HOST}" >>"$LOG_FILE" 2>&1 &
+    ssh_pid="$!"
+    echo "$ssh_pid" > "$SSH_PID_FILE"
 
-    rc=$?
+    rc=0
+    if wait "$ssh_pid"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    rm -f "$SSH_PID_FILE"
     log "ssh exited with code=$rc"
 
-    if [[ -f "$STOP_FLAG" ]]; then
-      log "stop flag set; not restarting"
-      break
-    fi
+    [[ -f "$STOP_FLAG" ]] && { log "stop flag set; not restarting"; break; }
 
     log "restarting in ${backoff}s (auto-restart)"
     sleep "$backoff"
@@ -157,9 +207,6 @@ run_loop() {
       (( backoff > max_backoff )) && backoff=$max_backoff
     fi
   done
-
-  rm -f "$PID_FILE" "$STOP_FLAG"
-  log "tunnel supervisor stopped"
 }
 
 # ----------------------------
@@ -175,15 +222,21 @@ cmd_start() {
     exit 0
   fi
 
-  # Clean stale pidfile
-  rm -f "$PID_FILE" "$STOP_FLAG"
+  # Hard rule: do NOT start if port is in use.
+  if port_in_use; then
+    kill_ssh_listeners_on_port
+  fi
+  if port_in_use; then
+    show_port_listeners
+    die "Port ${SOCKS_PORT}/TCP is in use. Stop the listener or change SOCKS_PORT."
+  fi
 
-  # Start supervisor in background (nohup keeps it alive if terminal closes)
+  rm -f "$PID_FILE" "$STOP_FLAG" "$SSH_PID_FILE"
+
   nohup "$0" _run_loop >/dev/null 2>&1 &
   disown || true
 
-  # Wait briefly for pidfile
-  for _ in {1..20}; do
+  for _ in {1..40}; do
     pid="$(get_pid)"
     if [[ -n "$pid" ]] && is_running_pid "$pid"; then
       echo "Started. Supervisor PID=$pid"
@@ -199,18 +252,45 @@ cmd_start() {
 cmd_stop() {
   ensure_state_dir
 
-  local pid
+  local pid ssh_pid
   pid="$(get_pid)"
+  ssh_pid="$(get_ssh_pid)"
+
+  # Even if pidfile is missing, still try to clean the port.
   if [[ -z "$pid" ]]; then
     echo "Not running (no PID file)."
+    kill_ssh_listeners_on_port
+    if port_in_use; then
+      show_port_listeners
+      die "Port ${SOCKS_PORT}/TCP still in use."
+    fi
+    echo "Stopped."
     exit 0
   fi
 
   echo "Stopping (PID=$pid) ..."
   touch "$STOP_FLAG"
+
+  # Kill child ssh first (frees the port faster)
+  if [[ -n "$ssh_pid" ]]; then
+    kill_pid_gracefully "$ssh_pid"
+    rm -f "$SSH_PID_FILE"
+  fi
+
+  # Then kill supervisor
   kill_pid_gracefully "$pid"
 
+  # Extra safety: kill orphan ssh listeners on the port
+  kill_ssh_listeners_on_port
+
   rm -f "$PID_FILE" "$STOP_FLAG"
+
+  # Verify
+  if port_in_use; then
+    show_port_listeners
+    die "Stop finished, but port ${SOCKS_PORT}/TCP is still in use."
+  fi
+
   echo "Stopped."
 }
 
@@ -219,9 +299,18 @@ cmd_status() {
   pid="$(get_pid)"
   if [[ -n "$pid" ]] && is_running_pid "$pid"; then
     echo "RUNNING (PID=$pid) — SOCKS5 on ${SOCKS_HOST}:${SOCKS_PORT}"
+    if port_in_use; then
+      show_port_listeners
+    else
+      echo "WARNING: supervisor running, but no listener on TCP/${SOCKS_PORT}."
+    fi
     exit 0
   fi
   echo "STOPPED"
+  if port_in_use; then
+    echo "WARNING: STOPPED, but someone is still LISTENing on TCP/${SOCKS_PORT}."
+    show_port_listeners
+  fi
   exit 1
 }
 
@@ -239,11 +328,11 @@ cmd_logs() {
 # Entry
 # ----------------------------
 case "${1:-start}" in
-  start)   cmd_start ;;
-  stop)    cmd_stop ;;
-  status)  cmd_status ;;
-  restart) cmd_restart ;;
-  logs)    cmd_logs ;;
+  start)    cmd_start ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  restart)  cmd_restart ;;
+  logs)     cmd_logs ;;
   _run_loop) run_loop ;;
   *)
     cat <<EOF
@@ -254,6 +343,7 @@ Environment overrides (optional):
   SOCKS_HOST, SOCKS_PORT
   ALIVE_INTERVAL, ALIVE_COUNTMAX
   STATE_DIR
+  KILL_SSH_LISTENERS_ON_PORT (default: 1)
 
 Example:
   SSH_HOST=dark-horse SSH_USER=cowboy SSH_PORT=2222 \\
